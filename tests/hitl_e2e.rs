@@ -71,6 +71,7 @@ fn callback_query(id: &str, data: &str) -> CallbackQuery {
         "id": id,
         "from": { "id": TEST_APPROVER, "first_name": "tester" },
         "data": data,
+        "message": { "message_id": 1_i64, "chat": { "id": 12345_i64 } },
     });
     serde_json::from_value(json).expect("CallbackQuery deserializes")
 }
@@ -83,6 +84,7 @@ fn update(update_id: i64, cb: CallbackQuery) -> Update {
             "id": "fallback",
             "from": { "id": TEST_APPROVER, "first_name": "tester" },
             "data": "approve:start:1",
+            "message": { "message_id": 1_i64, "chat": { "id": 12345_i64 } },
         })
     });
     let json = serde_json::json!({
@@ -170,7 +172,7 @@ async fn callback_from_unlisted_user_is_refused() {
         "id": "cb-intruder",
         "from": { "id": 9999_i64, "first_name": "intruder" },
         "data": data,
-        "message": { "message_id": 1_i64 },
+        "message": { "message_id": 1_i64, "chat": { "id": 12345_i64 } },
     }))
     .expect("CallbackQuery deserializes");
     let gw = HitlMockGateway::new();
@@ -301,7 +303,7 @@ async fn quorum_of_two_needs_two_distinct_approvers() {
         "id": "cb-q2",
         "from": { "id": SECOND, "first_name": "second" },
         "data": data,
-        "message": { "message_id": 1_i64 },
+        "message": { "message_id": 1_i64, "chat": { "id": 12345_i64 } },
     }))
     .expect("CallbackQuery deserializes");
     let done = handle_callback_update(&update(3, cb2), &pending, &gw, &tg)
@@ -1680,7 +1682,7 @@ async fn fast_op_skips_intermediate_executing_edit() {
         "id": "cb-fast",
         "from": { "id": TEST_APPROVER, "first_name": "tester" },
         "data": data,
-        "message": { "message_id": 42 },
+        "message": { "message_id": 42, "chat": { "id": 12345_i64 } },
     });
     let upd: Update = serde_json::from_value(serde_json::json!({
         "update_id": 99,
@@ -1912,4 +1914,296 @@ async fn legacy_unsigned_callback_is_refused_in_v0_1_22() {
         0,
         "refused txn must not consume the slot"
     );
+}
+
+// ── Issues #336 + #337: Unified callback verification & TUI round-trip ──
+
+/// Issue #336: TUI round trip with a stub gateway — register a txn via the
+/// TUI coordinator, build the `callback_data` with the REAL keyboard builder
+/// from `telegram.rs` (`build_approval_keyboard`), feed it to the TUI poller's
+/// handling function (`handle_tui_callback_query`) -> the op resolves approved.
+#[tokio::test]
+async fn tui_round_trip_with_real_keyboard_builder_resolves_approved() {
+    let server = setup_telegram_mock().await;
+    let tg = fake_gateway(&server);
+    let coord = proxxx::tui::HitlCoordinator::new();
+
+    let txn_id = "stop:100-1739999999999".to_string();
+    let mut rx = coord.register(txn_id.clone()).await;
+
+    // Build callback_data with the REAL keyboard builder from telegram.rs.
+    let keyboard = tg.build_approval_keyboard(&txn_id, 1);
+    let approve_btn = &keyboard.inline_keyboard[0][0];
+    assert!(approve_btn.text.contains("Approve"));
+
+    let cb: CallbackQuery = serde_json::from_value(serde_json::json!({
+        "id": "cb-tui-ok",
+        "from": { "id": TEST_APPROVER, "first_name": "tester" },
+        "data": approve_btn.callback_data,
+        "message": { "message_id": 42_i64, "chat": { "id": 12345_i64 } },
+    }))
+    .expect("CallbackQuery deserializes");
+
+    let answer = proxxx::tui::handle_tui_callback_query(&tg, &coord, &cb)
+        .await
+        .expect("callback answered");
+    assert!(
+        answer.contains("Approved") || answer.contains("Executed"),
+        "expected Approved/Executed callback answer, got: {answer}"
+    );
+
+    let resolved = rx
+        .try_recv()
+        .expect("TUI pending op must be resolved after valid approve callback");
+    assert!(resolved, "op must resolve as approved (true)");
+}
+
+fn build_tui_callback_for_test(
+    id: &str,
+    from_id: i64,
+    first_name: &str,
+    data: &str,
+    chat_id: i64,
+) -> CallbackQuery {
+    serde_json::from_value(serde_json::json!({
+        "id": id,
+        "from": { "id": from_id, "first_name": first_name },
+        "data": data,
+        "message": { "message_id": 1_i64, "chat": { "id": chat_id } },
+    }))
+    .expect("CallbackQuery")
+}
+
+async fn assert_tui_rejections(
+    tg: &TelegramGateway,
+    coord: &proxxx::tui::HitlCoordinator,
+    rx: &mut tokio::sync::oneshot::Receiver<bool>,
+    approve_data: &str,
+) {
+    // 1. Wrong chat id -> NOT resolved, answer explains wrong chat.
+    let cb_wrong_chat = build_tui_callback_for_test(
+        "cb-wrong-chat",
+        TEST_APPROVER,
+        "tester",
+        approve_data,
+        99999,
+    );
+    let ans = proxxx::tui::handle_tui_callback_query(tg, coord, &cb_wrong_chat)
+        .await
+        .expect("answer");
+    assert!(
+        ans.to_ascii_lowercase().contains("wrong chat"),
+        "wrong chat answer must explain why, got: {ans}"
+    );
+    assert!(
+        rx.try_recv().is_err(),
+        "wrong chat must not resolve the pending op"
+    );
+
+    // 2. Sender not in allowed_approvers -> NOT resolved, answer explains unauthorised.
+    let cb_unlisted =
+        build_tui_callback_for_test("cb-unlisted", 7777, "intruder", approve_data, 12345);
+    let ans = proxxx::tui::handle_tui_callback_query(tg, coord, &cb_unlisted)
+        .await
+        .expect("answer");
+    assert!(
+        ans.to_ascii_lowercase()
+            .contains("not an authorised approver")
+            || ans.to_ascii_lowercase().contains("refused"),
+        "unauthorised sender answer must explain why, got: {ans}"
+    );
+    assert!(
+        rx.try_recv().is_err(),
+        "unauthorised sender must not resolve the pending op"
+    );
+
+    // 3. Tampered HMAC -> NOT resolved, answer explains signature failure.
+    let mut tampered = approve_data.to_string();
+    let last = tampered.pop().expect("non-empty");
+    tampered.push(if last == '0' { '1' } else { '0' });
+    let cb_tampered =
+        build_tui_callback_for_test("cb-tampered", TEST_APPROVER, "tester", &tampered, 12345);
+    let ans = proxxx::tui::handle_tui_callback_query(tg, coord, &cb_tampered)
+        .await
+        .expect("answer");
+    assert!(
+        ans.to_ascii_lowercase().contains("signature"),
+        "tampered HMAC answer must mention signature verification failure, got: {ans}"
+    );
+    assert!(
+        rx.try_recv().is_err(),
+        "tampered HMAC must not resolve the pending op"
+    );
+}
+
+/// Issue #337: TUI rejections (wrong chat id, sender not in `allowed_approvers`,
+/// tampered HMAC -> op NOT resolved and the callback answer says why) and
+/// `require = 2` quorum enforcement (one press -> not resolved; same user twice
+/// -> not resolved; a second distinct approver -> resolved).
+#[tokio::test]
+async fn tui_rejections_and_quorum_enforcement() {
+    const SECOND_APPROVER: i64 = 5150;
+    let server = setup_telegram_mock().await;
+    let tg = fake_gateway(&server).with_allowed_approvers(vec![TEST_APPROVER, SECOND_APPROVER]);
+    let coord = proxxx::tui::HitlCoordinator::new();
+
+    let txn_id = "stop:100-1739999999999".to_string();
+    let mut rx = coord.register(txn_id.clone()).await;
+
+    let keyboard = tg.build_approval_keyboard(&txn_id, 2);
+    let approve_data = keyboard.inline_keyboard[0][0].callback_data.clone();
+
+    assert_tui_rejections(&tg, &coord, &mut rx, &approve_data).await;
+
+    // 4. Quorum require = 2: first press by TEST_APPROVER -> recorded (1/2), NOT resolved.
+    let cb_vote1 =
+        build_tui_callback_for_test("cb-vote1", TEST_APPROVER, "tester", &approve_data, 12345);
+    let ans1 = proxxx::tui::handle_tui_callback_query(&tg, &coord, &cb_vote1)
+        .await
+        .expect("answer");
+    assert!(
+        ans1.contains("1/2"),
+        "first vote of require=2 must report 1/2 progress, got: {ans1}"
+    );
+    assert!(
+        rx.try_recv().is_err(),
+        "single vote must not resolve a require=2 op"
+    );
+
+    // 5. Same user pressing a second time -> duplicate (1/2), still NOT resolved.
+    let ans1_dup = proxxx::tui::handle_tui_callback_query(&tg, &coord, &cb_vote1)
+        .await
+        .expect("answer");
+    assert!(
+        ans1_dup.contains("already approved") && ans1_dup.contains("1/2"),
+        "duplicate vote must report already approved 1/2, got: {ans1_dup}"
+    );
+    assert!(
+        rx.try_recv().is_err(),
+        "same approver pressing twice must not resolve a require=2 op"
+    );
+
+    // 6. Second distinct approver -> resolves approved!
+    let cb_vote2 =
+        build_tui_callback_for_test("cb-vote2", SECOND_APPROVER, "second", &approve_data, 12345);
+    let ans2 = proxxx::tui::handle_tui_callback_query(&tg, &coord, &cb_vote2)
+        .await
+        .expect("answer");
+    assert!(
+        ans2.contains("Approved") || ans2.contains("Executed"),
+        "second distinct vote must report Approved/Executed, got: {ans2}"
+    );
+    assert!(rx.try_recv().expect("require=2 op must now resolve"));
+
+    // 7. Subsequent press after resolution -> "Expired or unknown request".
+    let ans_stale = proxxx::tui::handle_tui_callback_query(&tg, &coord, &cb_vote2)
+        .await
+        .expect("answer");
+    assert!(
+        ans_stale.contains("Expired or unknown request"),
+        "callback for already-resolved/unknown txn must say 'Expired or unknown request', got: {ans_stale}"
+    );
+}
+
+/// Requirement 4: Daemon behaviour unchanged and `verify_callback` enforces
+/// HMAC, `chat_id`, `allowed_approvers`, and payload parsing in order before
+/// `handle_callback_update` dispatches.
+#[tokio::test]
+async fn daemon_verify_callback_and_handle_callback_update_round_trip() {
+    let server = setup_telegram_mock().await;
+    let tg = fake_gateway(&server);
+    let keyboard = tg.build_approval_keyboard("stop:100", 1);
+    let approve_data = keyboard.inline_keyboard[0][0].callback_data.clone();
+
+    let cb: CallbackQuery = serde_json::from_value(serde_json::json!({
+        "id": "cb-daemon-verify",
+        "from": { "id": TEST_APPROVER, "first_name": "tester" },
+        "data": approve_data,
+        "message": { "message_id": 10_i64, "chat": { "id": 12345_i64 } },
+    }))
+    .expect("CallbackQuery");
+
+    let verified = proxxx::hitl::daemon::verify_callback(&tg, &cb)
+        .expect("verify_callback must accept valid signed callback");
+    assert_eq!(
+        verified.decision,
+        proxxx::hitl::daemon::CallbackDecision::Approve
+    );
+    assert_eq!(verified.txn_id, "stop:100");
+    assert_eq!(verified.require, 1);
+    assert_eq!(verified.approver_id, TEST_APPROVER);
+
+    let pending = PendingApprovals::new();
+    let gw = HitlMockGateway::new().with_node_and_guest("pve1", guest(100, "vm-100"));
+    let out = handle_callback_update(&update(1, cb), &pending, &gw, &tg)
+        .await
+        .expect("handle_callback_update");
+    assert!(
+        matches!(out, CallbackOutcome::Executed { vmid: 100, .. }),
+        "daemon must execute after verify_callback, got {out:?}"
+    );
+}
+
+/// A callback without an originating chat (`message: None` or `message.chat: None`)
+/// must be rejected by `verify_callback`, the daemon, and the TUI poller.
+#[tokio::test]
+async fn callback_without_originating_chat_is_rejected() {
+    let server = setup_telegram_mock().await;
+    let tg = fake_gateway(&server);
+    let coord = proxxx::tui::HitlCoordinator::new();
+    let txn_id = "stop:100".to_string();
+    let mut rx = coord.register(txn_id.clone()).await;
+
+    let keyboard = tg.build_approval_keyboard(&txn_id, 1);
+    let approve_data = keyboard.inline_keyboard[0][0].callback_data.clone();
+
+    let cb_no_message: CallbackQuery = serde_json::from_value(serde_json::json!({
+        "id": "cb-no-msg",
+        "from": { "id": TEST_APPROVER, "first_name": "tester" },
+        "data": approve_data,
+    }))
+    .expect("CallbackQuery");
+
+    let cb_no_chat: CallbackQuery = serde_json::from_value(serde_json::json!({
+        "id": "cb-no-chat",
+        "from": { "id": TEST_APPROVER, "first_name": "tester" },
+        "data": approve_data,
+        "message": { "message_id": 1_i64 },
+    }))
+    .expect("CallbackQuery");
+
+    for cb in [&cb_no_message, &cb_no_chat] {
+        let verified = proxxx::hitl::daemon::verify_callback(&tg, cb);
+        assert_eq!(
+            verified,
+            Err(proxxx::hitl::daemon::CallbackRejection::MissingChat),
+            "verify_callback must reject callback without chat as MissingChat"
+        );
+
+        let ans = proxxx::tui::handle_tui_callback_query(&tg, &coord, cb)
+            .await
+            .expect("answer");
+        assert!(
+            ans.to_ascii_lowercase().contains("wrong chat"),
+            "TUI rejection for missing chat must explain wrong chat, got: {ans}"
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "callback without chat must not resolve TUI pending op"
+        );
+
+        let pending = PendingApprovals::new();
+        let gw = HitlMockGateway::new().with_node_and_guest("pve1", guest(100, "vm-100"));
+        let out = handle_callback_update(&update(1, cb.clone()), &pending, &gw, &tg)
+            .await
+            .expect("handle_callback_update");
+        assert!(
+            matches!(out, CallbackOutcome::WrongChat { .. }),
+            "daemon must reject callback without chat as WrongChat, got: {out:?}"
+        );
+        assert!(
+            gw.calls_for("shutdown_guest").is_empty(),
+            "callback without chat must not execute on gateway"
+        );
+    }
 }
