@@ -361,3 +361,129 @@ fn main() -> Result<()> {
 
     Ok(())
 }
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+mod tests {
+    use super::*;
+    use std::collections::BTreeSet;
+
+    fn collect_global_arg_collisions(
+        cmd: &clap::Command,
+        path: &str,
+        global_ids: &BTreeSet<String>,
+        collisions: &mut Vec<String>,
+    ) {
+        for sub in cmd.get_subcommands() {
+            let sub_path = format!("{path} {}", sub.get_name());
+            for arg in sub.get_arguments() {
+                let id = arg.get_id().as_str();
+                // `incident freeze` and `incident thaw` (`src/cli/incident.rs:50,64`)
+                // declare a local `profile` with the same id and the same type
+                // (`Option<String>`) as the global `--profile`. Clap fills both fields
+                // from either position (verified by parse assertions below), so it does
+                // not panic and does not misroute; it is exempted as a deliberate,
+                // harmless duplicate.
+                if (sub_path == "proxxx incident freeze" || sub_path == "proxxx incident thaw")
+                    && id == "profile"
+                {
+                    continue;
+                }
+                if global_ids.contains(id) {
+                    collisions.push(format!("{sub_path} (arg `{id}`)"));
+                }
+            }
+            collect_global_arg_collisions(sub, &sub_path, global_ids, collisions);
+        }
+    }
+
+    #[test]
+    fn no_subcommand_arg_collides_with_global_args() {
+        let root = Cli::command();
+        let global_ids: BTreeSet<String> = root
+            .get_arguments()
+            .filter(|a| a.is_global_set())
+            .map(|a| a.get_id().as_str().to_owned())
+            .collect();
+        assert!(
+            !global_ids.is_empty(),
+            "expected at least one global argument on root Cli"
+        );
+
+        let mut collisions = Vec::new();
+        collect_global_arg_collisions(&root, root.get_name(), &global_ids, &mut collisions);
+        assert!(
+            collisions.is_empty(),
+            "subcommands define arguments whose id collides with a global argument: [{}]",
+            collisions.join(", ")
+        );
+    }
+
+    #[test]
+    fn formerly_colliding_subcommands_parse_without_panic() {
+        Cli::try_parse_from(["proxxx", "audit", "export"]).unwrap();
+        Cli::try_parse_from(["proxxx", "audit", "export", "--export-format", "csv"]).unwrap();
+        Cli::try_parse_from(["proxxx", "events", "stream"]).unwrap();
+        let events_json =
+            Cli::try_parse_from(["proxxx", "--format", "json", "events", "stream"]).unwrap();
+        assert!(matches!(
+            events_json.format,
+            util::format::OutputFormat::Json
+        ));
+        Cli::try_parse_from(["proxxx", "import", "x.vmdk", "--source-format", "vmdk"]).unwrap();
+
+        let bad_export =
+            Cli::try_parse_from(["proxxx", "audit", "export", "--export-format", "xml"]);
+        assert!(
+            bad_export.is_err(),
+            "expected --export-format xml to be rejected by clap"
+        );
+
+        let bad_import =
+            Cli::try_parse_from(["proxxx", "import", "x.vmdk", "--source-format", "iso"]);
+        assert!(
+            bad_import.is_err(),
+            "expected --source-format iso to be rejected by clap"
+        );
+
+        let freeze_before = Cli::try_parse_from([
+            "proxxx",
+            "--profile",
+            "prod",
+            "incident",
+            "freeze",
+            "--reason",
+            "x",
+        ])
+        .unwrap();
+        assert_eq!(freeze_before.profile.as_deref(), Some("prod"));
+        assert_eq!(
+            format!("{:?}", freeze_before.command),
+            "Some(Incident { action: Freeze { reason: \"x\", ttl: None, profile: Some(\"prod\") } })"
+        );
+
+        let freeze_after = Cli::try_parse_from([
+            "proxxx",
+            "incident",
+            "freeze",
+            "--reason",
+            "x",
+            "--profile",
+            "prod",
+        ])
+        .unwrap();
+        assert_eq!(freeze_after.profile.as_deref(), Some("prod"));
+        assert_eq!(
+            format!("{:?}", freeze_after.command),
+            "Some(Incident { action: Freeze { reason: \"x\", ttl: None, profile: Some(\"prod\") } })"
+        );
+
+        let freeze_none =
+            Cli::try_parse_from(["proxxx", "incident", "freeze", "--reason", "x"]).unwrap();
+        assert_eq!(freeze_none.profile, None);
+        assert_eq!(
+            format!("{:?}", freeze_none.command),
+            "Some(Incident { action: Freeze { reason: \"x\", ttl: None, profile: None } })"
+        );
+    }
+}
