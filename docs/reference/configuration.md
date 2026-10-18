@@ -115,11 +115,13 @@ max_unmanned_changes = 5              # hard cap on changes-per-tick for the UNM
 
 ```toml
 [ssh]
-key  = "/home/fab/.ssh/proxxx_homelab"   # ed25519 / rsa private key path
-host = "10.0.0.1"                    # default node for `proxxx perms` and patching
-port = 22                                  # optional, default 22
+key_path = "/home/fab/.ssh/proxxx_homelab" # ed25519 / rsa private key path
 user = "root"                              # optional, default "root"
+strict_host_key_checking = "tofu"           # tofu, strict, or off
 known_hosts = "~/.config/proxxx/known_hosts"  # optional, default to XDG path
+
+[ssh.hosts]
+pve1 = "10.0.0.1:22"                        # optional per-node override
 ```
 
 ## `[ssh.guests.<vmid>]` (optional override)
@@ -297,5 +299,5 @@ Common errors:
 - **`token_secret` has trailing whitespace** — copy-paste from the
   web UI sometimes appends a newline; trim it
 - **`auth = "token"` without `token_id`** — both fields are required
-- **`[ssh]` referenced but `key` is missing** — `proxxx ssh <vmid>`,
+- **`[ssh]` referenced but `key_path` is missing** — `proxxx ssh <vmid>`,
   `proxxx perms`, and `proxxx patch apply` all require it

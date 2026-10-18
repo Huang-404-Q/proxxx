@@ -149,6 +149,10 @@ SemVer contract:
 
 ### Changed
 
+- **Configuration typos now fail loudly.** TOML config sections reject
+  unknown keys instead of silently dropping them, and the SSH examples use
+  the actual `key_path` and `hosts` fields.
+
 - **The live tier moved off GitHub Actions and onto a LAN-only box.**
   v0.14.0 added `.github/workflows/live-tier.yml`, a `workflow_dispatch`
   job on a self-hosted runner, to close the audit finding that the
