@@ -192,6 +192,7 @@ pub struct AlertRuleConfig {
     pub name: String,
     /// One of `"node_offline" | "storage_above" | "replication_failing"`.
     /// Unknown values cause the engine to skip the rule with a warn log.
+    #[serde(alias = "trigger")]
     pub when: String,
     /// For `node_offline`: minimum seconds offline before firing.
     /// Default 60.

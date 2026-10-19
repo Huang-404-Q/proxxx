@@ -39,7 +39,7 @@ For `auth = "token"`, set `token_id` and one of: `token_secret`,
 `token_secret_file`, `PROXXX_TOKEN_SECRET` env, or store it in the
 keychain.
 
-For `auth = "password"`, set `password`, `password_file`,
+For `auth = "password"`, set `password`,
 `PROXXX_PASSWORD` env, or keychain.
 
 ## Secrets
@@ -288,7 +288,7 @@ See [HITL via Telegram](/integrations/hitl).
 [[alerts]]
 name        = "node_down"
 trigger     = "node_offline"
-threshold   = 60                     # seconds offline before firing
+for_secs    = 60                     # seconds offline before firing
 route       = ["telegram", "ntfy:proxxx-prod"]
 dedup_secs  = 600                    # don't re-fire within 10 min
 ```

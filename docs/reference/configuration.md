@@ -30,7 +30,6 @@ token_id      = "proxxx"
 token_secret  = "..."                 # plain string OR
 token_secret_file = "/etc/proxxx/token"
 password      = "..."                 # only if auth = "password"
-password_file = "..."
 verify_tls    = true                  # validate the cluster cert. DEFAULT true
                                       # since v0.13.4 (was false). Proxmox ships
                                       # a self-signed cert: set false deliberately
@@ -212,7 +211,7 @@ pre-format the secret.
 [[alerts]]
 name              = "node_down"
 trigger           = "node_offline"           # closed enum: see Alerts integration
-threshold         = 60                        # seconds
+for_secs          = 60                        # seconds
 storage           = "ceph-rbd"                # filter for storage_above (optional)
 threshold_percent = 85                        # for storage_above
 severity          = "critical"                # info | warning | critical

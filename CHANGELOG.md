@@ -149,9 +149,11 @@ SemVer contract:
 
 ### Changed
 
-- **Configuration typos now fail loudly.** TOML config sections reject
-  unknown keys instead of silently dropping them, and the SSH examples use
-  the actual `key_path` and `hosts` fields.
+- **Configuration typos now fail loudly (#326).** All TOML configuration
+  sections reject unknown keys; configs that contain unknown keys now fail
+  to load; previously the keys were ignored. Stale documentation examples
+  (such as `[ssh].key`, `threshold`, and `password_file`) have been corrected
+  and are now drift-proofed in CI.
 
 - **The live tier moved off GitHub Actions and onto a LAN-only box.**
   v0.14.0 added `.github/workflows/live-tier.yml`, a `workflow_dispatch`
