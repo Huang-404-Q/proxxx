@@ -30,6 +30,13 @@ mod http_status {
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     async fn client_for(server: &MockServer) -> PxClient {
+        static TEST_AUDIT_DIR: std::sync::OnceLock<tempfile::TempDir> = std::sync::OnceLock::new();
+        let audit_dir = TEST_AUDIT_DIR
+            .get_or_init(|| {
+                tempfile::tempdir().expect("create temp audit dir for error_handling_e2e")
+            })
+            .path()
+            .to_path_buf();
         let cfg = ProfileConfig {
             url: server.uri(),
             user: "root@pam".into(),
@@ -54,6 +61,7 @@ mod http_status {
         PxClient::new(cfg, Some("fake-secret"))
             .await
             .expect("client builds")
+            .with_audit_dir(audit_dir)
     }
 
     fn downcast(err: &anyhow::Error) -> Option<&ApiError> {

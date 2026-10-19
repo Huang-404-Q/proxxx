@@ -60,6 +60,11 @@ use wiremock::{Mock, MockServer, Request, ResponseTemplate};
 /// flows into the configured profile so the client picks the right auth
 /// header shape (token-auth uses the user as the principal).
 async fn persona_client(server: &MockServer, user: &str) -> PxClient {
+    static TEST_AUDIT_DIR: std::sync::OnceLock<tempfile::TempDir> = std::sync::OnceLock::new();
+    let audit_dir = TEST_AUDIT_DIR
+        .get_or_init(|| tempfile::tempdir().expect("create temp audit dir for rbac_e2e"))
+        .path()
+        .to_path_buf();
     // Pass the secret as cli_secret (resolver priority #1) instead of
     // mutating PROXXX_TOKEN_SECRET. Env state is process-global and
     // cargo runs integration tests in parallel — set_var would race
@@ -88,6 +93,7 @@ async fn persona_client(server: &MockServer, user: &str) -> PxClient {
     PxClient::new(cfg, Some("fake-secret"))
         .await
         .expect("client builds")
+        .with_audit_dir(audit_dir)
 }
 
 /// Stock 403 response in PVE's standard envelope.

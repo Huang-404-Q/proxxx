@@ -36,6 +36,23 @@ pub struct AuditEntry {
     pub chain_hmac: String,
 }
 
+/// Refusal returned when the write-ahead `"sent"` audit record cannot be
+/// persisted before a mutation (`#344`). Carried via `anyhow` so `main.rs`
+/// downcasts it to exit code 8 ("mutation refused by a local lock", shared
+/// with `ReadOnlyRefusal`, `FreezeRefusal`, and `SecureModeRefusal`).
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("audit log refused mutation `{action}`: {reason}")]
+pub struct AuditWriteRefusal {
+    pub action: String,
+    pub reason: String,
+}
+
+impl AuditWriteRefusal {
+    /// Process exit code — matches the "mutation refused by a local lock"
+    /// family (`read_only` / `incident freeze` / `--secure`, exit code 8).
+    pub const EXIT_CODE: i32 = 8;
+}
+
 /// Append-only SQLite-backed audit logger.
 pub struct AuditLogger {
     conn: Connection,
@@ -45,9 +62,28 @@ pub struct AuditLogger {
 impl AuditLogger {
     pub fn open() -> Result<Self> {
         let path = audit_db_path()?;
-        let key = load_or_create_key(&audit_key_path()?)?;
-        let conn = Connection::open(&path)
+        let key_path = audit_key_path()?;
+        Self::open_at(&path, &key_path)
+    }
+
+    /// Open an [`AuditLogger`] rooted in an explicit directory (`dir/audit.db`
+    /// + `dir/audit.key`) without reading or mutating `PROXXX_AUDIT_DIR`
+    /// (`#344` Rev. 17).
+    ///
+    /// # Errors
+    /// Returns an error if the directory, key, or database cannot be created
+    /// or opened.
+    pub fn open_in(dir: &std::path::Path) -> Result<Self> {
+        ensure_audit_dir_exists(dir)?;
+        Self::open_at(&dir.join("audit.db"), &dir.join("audit.key"))
+    }
+
+    fn open_at(path: &std::path::Path, key_path: &std::path::Path) -> Result<Self> {
+        let key_existed = key_path.exists();
+        let key = load_or_create_key(&key_path.to_path_buf())?;
+        let conn = Connection::open(path)
             .with_context(|| format!("open audit db at {}", path.display()))?;
+        let _ = conn.busy_timeout(std::time::Duration::from_secs(5));
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS audit_log (
                 id         INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -65,6 +101,24 @@ impl AuditLogger {
         )?;
         migrate_chain_version(&conn)?;
         migrate_key_id(&conn)?;
+        if !key_existed {
+            let existing_primary_rows: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM audit_log WHERE key_id = ?1",
+                    params![PRIMARY_KEY_ID],
+                    |r| r.get(0),
+                )
+                .unwrap_or(0);
+            if existing_primary_rows > 0 {
+                let _ = std::fs::remove_file(key_path);
+                anyhow::bail!(
+                    "audit key at {} was missing while {} already contains {existing_primary_rows} \
+                     row(s) signed with `{PRIMARY_KEY_ID}` — refusing to start a forged chain",
+                    key_path.display(),
+                    path.display()
+                );
+            }
+        }
         Ok(Self { conn, key })
     }
 
@@ -77,7 +131,7 @@ impl AuditLogger {
         params_json: Option<&str>,
         result: &str,
     ) -> Result<()> {
-        let prev_hmac = self.last_chain_hmac();
+        let prev_hmac = self.last_chain_hmac()?;
         let ts = chrono_now();
         let vmid_str = vmid.map(|v| v.to_string()).unwrap_or_default();
         // v2: the actor (`user`) and the parameters (`node`, `params_json`)
@@ -136,6 +190,7 @@ impl AuditLogger {
     }
 
     pub fn verify(&self) -> Result<(usize, usize)> {
+        FULL_VERIFY_CALLS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let mut stmt = self.conn.prepare(
             "SELECT ts,action,user,vmid,node,params_json,result,chain_hmac,chain_version,key_id
              FROM audit_log ORDER BY id ASC",
@@ -143,20 +198,7 @@ impl AuditLogger {
         let mut prev = String::new();
         let mut ok = 0usize;
         let mut fail = 0usize;
-        let rows = stmt.query_map([], |r| {
-            Ok((
-                r.get::<_, String>(0)?,         // ts
-                r.get::<_, String>(1)?,         // action
-                r.get::<_, String>(2)?,         // user
-                r.get::<_, Option<i64>>(3)?,    // vmid
-                r.get::<_, Option<String>>(4)?, // node
-                r.get::<_, Option<String>>(5)?, // params_json
-                r.get::<_, String>(6)?,         // result
-                r.get::<_, String>(7)?,         // chain_hmac
-                r.get::<_, i64>(8)?,            // chain_version
-                r.get::<_, String>(9)?,         // key_id
-            ))
-        })?;
+        let rows = stmt.query_map([], map_raw_audit_row)?;
         // #281 — a row is verified with the key it was signed with, so a
         // rotation does not invalidate everything written before it. The
         // primary key is already loaded; retired ones are read on first
@@ -164,71 +206,155 @@ impl AuditLogger {
         let mut retired: std::collections::HashMap<String, Option<Vec<u8>>> =
             std::collections::HashMap::new();
         for row in rows {
-            let (ts, action, user, vmid, node, params, result, stored_hmac, version, key_id) = row?;
+            let row = row?;
+            let key_id = &row.9;
             let key: &[u8] = if key_id == PRIMARY_KEY_ID {
                 &self.key
             } else {
                 let entry = retired
                     .entry(key_id.clone())
-                    .or_insert_with(|| load_retired_key(&key_id).ok());
+                    .or_insert_with(|| load_retired_key(key_id).ok());
                 let Some(k) = entry else {
                     // The key this row was signed with is gone, so its
                     // MAC cannot be recomputed. Count it as a failure
                     // rather than silently skipping: an unverifiable row
                     // IS a gap in the trail.
                     fail += 1;
-                    prev = stored_hmac;
+                    prev.clone_from(&row.7);
                     continue;
                 };
                 k.as_slice()
             };
-            let vmid_str = vmid.map(|v| v.to_string()).unwrap_or_default();
-            // Recompute under each row's OWN chain format, so legacy v1 rows
-            // keep verifying after the migration while new v2 rows get the
-            // stronger who/what coverage.
-            let expected = if version == CHAIN_V2 {
-                compute_hmac_v2(
-                    key,
-                    &prev,
-                    &ts,
-                    &action,
-                    &user,
-                    &vmid_str,
-                    node.as_deref().unwrap_or(""),
-                    params.as_deref().unwrap_or(""),
-                    &result,
-                )
-            } else {
-                compute_hmac(key, &prev, &ts, &action, &vmid_str, &result)
-            };
-            if expected == stored_hmac {
+            if verify_raw_row(&row, &prev, key) {
                 ok += 1;
             } else {
                 fail += 1;
             }
-            prev = stored_hmac;
+            prev = row.7;
         }
         Ok((ok, fail))
     }
 
-    fn last_chain_hmac(&self) -> String {
+    /// O(1) tail-link verification (`#344` Rev. 16): checks only that the last
+    /// row in `audit_log` (if any) verifies against its immediate predecessor
+    /// (`ORDER BY id DESC LIMIT 2`).
+    ///
+    /// # Errors
+    /// Returns an error if querying `audit_log` fails or if the tail row's
+    /// signing key is missing or its MAC does not match.
+    pub fn verify_tail(&self) -> Result<()> {
+        TAIL_VERIFY_CALLS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let mut stmt = self.conn.prepare(
+            "SELECT ts,action,user,vmid,node,params_json,result,chain_hmac,chain_version,key_id
+             FROM audit_log ORDER BY id DESC LIMIT 2",
+        )?;
+        let rows: Vec<RawAuditRow> = stmt
+            .query_map([], map_raw_audit_row)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let Some(last) = rows.first() else {
+            return Ok(());
+        };
+        let prev = rows.get(1).map_or("", |r| r.7.as_str());
+        let retired_key;
+        let key: &[u8] = if last.9 == PRIMARY_KEY_ID {
+            &self.key
+        } else {
+            let Ok(k) = load_retired_key(&last.9) else {
+                anyhow::bail!(
+                    "audit chain integrity check failed (1 tampered or unverifiable row(s))"
+                );
+            };
+            retired_key = k;
+            retired_key.as_slice()
+        };
+        if !verify_raw_row(last, prev, key) {
+            anyhow::bail!("audit chain integrity check failed (1 tampered or unverifiable row(s))");
+        }
+        Ok(())
+    }
+
+    fn last_chain_hmac(&self) -> Result<String> {
         match self.conn.query_row(
             "SELECT chain_hmac FROM audit_log ORDER BY id DESC LIMIT 1",
             [],
             |r| r.get::<_, String>(0),
         ) {
-            Ok(h) => h,
+            Ok(h) => Ok(h),
             // Empty log — this is the first entry; an empty prev-hmac is correct.
-            Err(rusqlite::Error::QueryReturnedNoRows) => String::new(),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(String::new()),
             // A real read error must not silently start a fresh chain segment.
-            Err(e) => {
-                tracing::warn!(
-                    "audit: could not read last chain hmac ({e}) — starting a new chain segment"
-                );
-                String::new()
-            }
+            Err(e) => Err(anyhow::Error::from(e).context("read last chain hmac")),
         }
     }
+}
+
+static FULL_VERIFY_CALLS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static TAIL_VERIFY_CALLS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Number of times [`AuditLogger::verify`] (the O(N) full-chain walk) has been
+/// called in this process (`#344` Rev. 16).
+#[must_use]
+pub fn full_verify_call_count() -> usize {
+    FULL_VERIFY_CALLS.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+/// Number of times [`AuditLogger::verify_tail`] (the O(1) tail-link check) has
+/// been called in this process (`#344` Rev. 16).
+#[must_use]
+pub fn tail_verify_call_count() -> usize {
+    TAIL_VERIFY_CALLS.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+type RawAuditRow = (
+    String,         // ts
+    String,         // action
+    String,         // user
+    Option<i64>,    // vmid
+    Option<String>, // node
+    Option<String>, // params_json
+    String,         // result
+    String,         // chain_hmac
+    i64,            // chain_version
+    String,         // key_id
+);
+
+fn map_raw_audit_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<RawAuditRow> {
+    Ok((
+        r.get::<_, String>(0)?,         // ts
+        r.get::<_, String>(1)?,         // action
+        r.get::<_, String>(2)?,         // user
+        r.get::<_, Option<i64>>(3)?,    // vmid
+        r.get::<_, Option<String>>(4)?, // node
+        r.get::<_, Option<String>>(5)?, // params_json
+        r.get::<_, String>(6)?,         // result
+        r.get::<_, String>(7)?,         // chain_hmac
+        r.get::<_, i64>(8)?,            // chain_version
+        r.get::<_, String>(9)?,         // key_id
+    ))
+}
+
+fn verify_raw_row(row: &RawAuditRow, prev: &str, key: &[u8]) -> bool {
+    let (ts, action, user, vmid, node, params, result, stored_hmac, version, _key_id) = row;
+    let vmid_str = vmid.map(|v| v.to_string()).unwrap_or_default();
+    // Recompute under each row's OWN chain format, so legacy v1 rows
+    // keep verifying after the migration while new v2 rows get the
+    // stronger who/what coverage.
+    let expected = if *version == CHAIN_V2 {
+        compute_hmac_v2(
+            key,
+            prev,
+            ts,
+            action,
+            user,
+            &vmid_str,
+            node.as_deref().unwrap_or(""),
+            params.as_deref().unwrap_or(""),
+            result,
+        )
+    } else {
+        compute_hmac(key, prev, ts, action, &vmid_str, result)
+    };
+    expected == *stored_hmac
 }
 
 fn row_to_entry(r: &rusqlite::Row<'_>) -> rusqlite::Result<AuditEntry> {
@@ -445,10 +571,29 @@ fn load_or_create_key(path: &PathBuf) -> Result<Vec<u8>> {
     Ok(key)
 }
 
+fn ensure_audit_dir_exists(dir: &std::path::Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(dir)
+            .with_context(|| format!("create audit dir {}", dir.display()))?;
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::create_dir_all(dir)
+            .with_context(|| format!("create audit dir {}", dir.display()))?;
+    }
+    Ok(())
+}
+
 /// Directory holding the audit DB + key. Honors `PROXXX_AUDIT_DIR` (for
-/// hermetic tests, and for relocating the trail onto a dedicated volume in
-/// ops); otherwise the platform data-local dir. Mirrors the `PROXXX_CONFIG` /
-/// `PROXXX_FREEZE_PATH` override convention. The directory is created if absent.
+/// relocating the trail onto a dedicated volume in ops, or for subprocess CLI
+/// tests); otherwise the platform data-local dir (or a process-local temp dir
+/// in `#[cfg(test)]`). Mirrors the `PROXXX_CONFIG` / `PROXXX_FREEZE_PATH`
+/// override convention. The directory is created if absent.
 ///
 /// Custody: on unix the dir is created `0700`. Dir-write is the precondition for
 /// *replacing* the HMAC key with an attacker-owned `0600` key (which the
@@ -460,25 +605,24 @@ fn audit_data_dir() -> Result<PathBuf> {
     let dir = if let Ok(dir) = std::env::var("PROXXX_AUDIT_DIR") {
         PathBuf::from(dir)
     } else {
-        directories::ProjectDirs::from("dev", "proxxx", "proxxx")
-            .ok_or_else(|| anyhow::anyhow!("cannot resolve data dir"))?
-            .data_local_dir()
-            .to_path_buf()
+        #[cfg(test)]
+        {
+            static TEST_DEFAULT_AUDIT_DIR: std::sync::OnceLock<tempfile::TempDir> =
+                std::sync::OnceLock::new();
+            TEST_DEFAULT_AUDIT_DIR
+                .get_or_init(|| tempfile::tempdir().expect("create fallback test audit dir"))
+                .path()
+                .to_path_buf()
+        }
+        #[cfg(not(test))]
+        {
+            directories::ProjectDirs::from("dev", "proxxx", "proxxx")
+                .ok_or_else(|| anyhow::anyhow!("cannot resolve data dir"))?
+                .data_local_dir()
+                .to_path_buf()
+        }
     };
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::DirBuilderExt;
-        std::fs::DirBuilder::new()
-            .recursive(true)
-            .mode(0o700)
-            .create(&dir)
-            .with_context(|| format!("create audit dir {}", dir.display()))?;
-    }
-    #[cfg(not(unix))]
-    {
-        std::fs::create_dir_all(&dir)
-            .with_context(|| format!("create audit dir {}", dir.display()))?;
-    }
+    ensure_audit_dir_exists(&dir)?;
     Ok(dir)
 }
 
@@ -519,17 +663,23 @@ fn retired_key_path(key_id: &str) -> Result<PathBuf> {
     Ok(primary.with_file_name(name))
 }
 
+/// Read an existing key (primary or retired) with the 0600 custody check,
+/// failing if the file does not exist instead of auto-generating a replacement.
+fn load_existing_key(path: &PathBuf, label: &str) -> Result<Vec<u8>> {
+    anyhow::ensure!(
+        path.exists(),
+        "audit key `{label}` is not present at {} — rows signed with it cannot \
+         be verified",
+        path.display()
+    );
+    load_or_create_key(path)
+}
+
 /// Read a retired key. Same 0600 custody check as the primary — a
 /// retired key still proves every row it signed.
 fn load_retired_key(key_id: &str) -> Result<Vec<u8>> {
     let path = retired_key_path(key_id)?;
-    anyhow::ensure!(
-        path.exists(),
-        "audit key `{key_id}` is not present at {} — rows signed with it cannot \
-         be verified",
-        path.display()
-    );
-    load_or_create_key(&path)
+    load_existing_key(&path, key_id)
 }
 
 /// Rotate the audit HMAC key (audit 2026-09-09, #281).
@@ -577,8 +727,307 @@ pub fn rotate_key() -> Result<String> {
 
     // Generating the new primary is the last step.
     let _new = load_or_create_key(&primary)?;
+    // Evict cached loggers so subsequent writes pick up the newly generated
+    // primary key.
+    if let Some(mutex) = PROCESS_AUDIT_LOGGERS.get() {
+        if let Ok(mut guard) = mutex.lock() {
+            guard.clear();
+        }
+    }
     info!(key_id = %key_id, "audit key rotated");
     Ok(key_id)
+}
+
+struct CachedAuditLogger {
+    db_path: PathBuf,
+    key_path: PathBuf,
+    logger: AuditLogger,
+    initial_fail_count: usize,
+}
+
+type LoggerCacheMap = std::collections::HashMap<(PathBuf, PathBuf), CachedAuditLogger>;
+
+static PROCESS_AUDIT_LOGGERS: std::sync::OnceLock<std::sync::Mutex<LoggerCacheMap>> =
+    std::sync::OnceLock::new();
+
+fn logger_cache() -> &'static std::sync::Mutex<LoggerCacheMap> {
+    PROCESS_AUDIT_LOGGERS.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+fn open_cached_logger(db_path: PathBuf, key_path: PathBuf) -> Result<CachedAuditLogger> {
+    let logger = AuditLogger::open_at(&db_path, &key_path)?;
+    let (_ok, initial_fail_count) = logger.verify()?;
+    Ok(CachedAuditLogger {
+        db_path,
+        key_path,
+        logger,
+        initial_fail_count,
+    })
+}
+
+fn resolve_db_and_key_paths(audit_dir: Option<&std::path::Path>) -> Result<(PathBuf, PathBuf)> {
+    if let Some(dir) = audit_dir {
+        ensure_audit_dir_exists(dir)?;
+        Ok((dir.join("audit.db"), dir.join("audit.key")))
+    } else {
+        Ok((audit_db_path()?, audit_key_path()?))
+    }
+}
+
+fn with_cached_logger_at<F, R>(audit_dir: Option<&std::path::Path>, f: F) -> Result<R>
+where
+    F: FnOnce(&mut CachedAuditLogger) -> Result<R>,
+{
+    let mut guard = logger_cache()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let (db_path, key_path) = resolve_db_and_key_paths(audit_dir)?;
+    let cache_key = (db_path.clone(), key_path.clone());
+    if let Some(cached) = guard.get(&cache_key) {
+        let disk_key = match load_existing_key(&cached.key_path, PRIMARY_KEY_ID) {
+            Ok(k) => k,
+            Err(e) => {
+                guard.remove(&cache_key);
+                return Err(e);
+            }
+        };
+        if disk_key != cached.logger.key || !cached.db_path.exists() {
+            guard.remove(&cache_key);
+        }
+    }
+    if !guard.contains_key(&cache_key) {
+        let opened = open_cached_logger(db_path, key_path)?;
+        guard.insert(cache_key.clone(), opened);
+    }
+    let Some(cached) = guard.get_mut(&cache_key) else {
+        anyhow::bail!("process audit logger unavailable");
+    };
+    f(cached)
+}
+
+/// Access the process-wide lazy [`AuditLogger`] (`#344`, Decision 4 & Rev. 16).
+///
+/// Opens `SQLite` and runs a full [`AuditLogger::verify`] at most once per
+/// `(db_path, key_path)` in the process (reopening only after key rotation or
+/// if the key/DB file is replaced on disk).
+///
+/// # Errors
+/// Returns an error if the audit directory, database, or signing key cannot
+/// be opened or validated, or if `f` returns an error.
+pub fn with_process_logger<F, R>(f: F) -> Result<R>
+where
+    F: FnOnce(&mut AuditLogger) -> Result<R>,
+{
+    with_cached_logger_at(None, |cached| f(&mut cached.logger))
+}
+
+/// Extract `(node, vmid)` from a Proxmox API path when present (`#344`,
+/// Decision 2):
+/// - `/nodes/<node>/...` -> `node = Some(<node>)`
+/// - `/(qemu|lxc)/<vmid>` -> `vmid = Some(<vmid>)`
+#[must_use]
+pub fn parse_pve_path(path: &str) -> (Option<String>, Option<u32>) {
+    let clean = path.split('?').next().unwrap_or(path);
+    let segments: Vec<&str> = clean.split('/').filter(|s| !s.is_empty()).collect();
+    let mut node = None;
+    let mut vmid = None;
+    let mut i = 0;
+    while i < segments.len() {
+        if let Some(&seg) = segments.get(i) {
+            match seg {
+                "nodes" => {
+                    if let Some(&n) = segments.get(i + 1) {
+                        if !n.is_empty() {
+                            node = Some(n.to_string());
+                        }
+                    }
+                }
+                "qemu" | "lxc" => {
+                    if let Some(&v) = segments.get(i + 1) {
+                        if let Ok(parsed) = v.parse::<u32>() {
+                            vmid = Some(parsed);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        i += 1;
+    }
+    (node, vmid)
+}
+
+/// Build the `params_json` object for a mutation audit record (`#344`,
+/// Decision 2), redacting secret parameter values and stamping the profile
+/// name.
+#[must_use]
+pub fn redact_params_json(params: &[(&str, &str)], profile: Option<&str>) -> String {
+    let mut map = serde_json::Map::with_capacity(params.len() + 1);
+    map.insert(
+        "profile".to_string(),
+        serde_json::Value::String(profile.unwrap_or("default").to_string()),
+    );
+    for &(k, v) in params {
+        let key = if k == "profile" {
+            "_form_profile".to_string()
+        } else {
+            k.to_string()
+        };
+        map.insert(
+            key,
+            serde_json::Value::String(crate::util::panic_hook::redact_param_value(k, v)),
+        );
+    }
+    serde_json::Value::Object(map).to_string()
+}
+
+/// Context for a two-phase (write-ahead `"sent"` + post-call outcome) mutation
+/// audit record (`#344`).
+#[derive(Debug, Clone)]
+pub struct MutationAuditCtx {
+    pub action: String,
+    pub user: String,
+    pub node: Option<String>,
+    pub vmid: Option<u32>,
+    pub params_json: String,
+    pub audit_dir: Option<PathBuf>,
+}
+
+impl MutationAuditCtx {
+    /// Parse `(node, vmid)` from `path` (falling back to a `vmid` form field),
+    /// redact secret parameters, and append the write-ahead `"sent"` audit
+    /// entry before the network request leaves the process.
+    ///
+    /// # Errors
+    /// Fails closed with [`AuditWriteRefusal`] (exit code 8) if the audit DB
+    /// or key cannot be opened, if the existing HMAC chain is broken, or if
+    /// the `"sent"` row cannot be inserted.
+    pub fn write_ahead(
+        method: &str,
+        path: &str,
+        params: &[(&str, &str)],
+        profile: Option<&str>,
+    ) -> Result<Self> {
+        Self::write_ahead_at(method, path, params, profile, None)
+    }
+
+    /// Like [`Self::write_ahead`], but writes to an explicit `audit_dir` when
+    /// `Some(dir)` is supplied (`#344` Rev. 17).
+    ///
+    /// # Errors
+    /// Fails closed with [`AuditWriteRefusal`] (exit code 8) if the write-ahead
+    /// entry cannot be persisted.
+    pub fn write_ahead_at(
+        method: &str,
+        path: &str,
+        params: &[(&str, &str)],
+        profile: Option<&str>,
+        audit_dir: Option<&std::path::Path>,
+    ) -> Result<Self> {
+        let action = format!("{method} {path}");
+        let (node, mut vmid) = parse_pve_path(path);
+        if vmid.is_none() {
+            vmid = params
+                .iter()
+                .find(|(k, _)| k.eq_ignore_ascii_case("vmid"))
+                .and_then(|(_, v)| v.parse::<u32>().ok());
+        }
+        Self::write_ahead_custom_at(&action, node.as_deref(), vmid, params, profile, audit_dir)
+    }
+
+    /// Write-ahead `"sent"` audit entry for non-REST mutations such as
+    /// `"SSH patch apply"` (`#344`, Decision 3).
+    ///
+    /// # Errors
+    /// Fails closed with [`AuditWriteRefusal`] (exit code 8) if the write-ahead
+    /// entry cannot be persisted.
+    pub fn write_ahead_custom(
+        action: &str,
+        node: Option<&str>,
+        vmid: Option<u32>,
+        params: &[(&str, &str)],
+        profile: Option<&str>,
+    ) -> Result<Self> {
+        Self::write_ahead_custom_at(action, node, vmid, params, profile, None)
+    }
+
+    /// Like [`Self::write_ahead_custom`], but writes to an explicit `audit_dir`
+    /// when `Some(dir)` is supplied (`#344` Rev. 17).
+    ///
+    /// # Errors
+    /// Fails closed with [`AuditWriteRefusal`] (exit code 8) if the write-ahead
+    /// entry cannot be persisted.
+    pub fn write_ahead_custom_at(
+        action: &str,
+        node: Option<&str>,
+        vmid: Option<u32>,
+        params: &[(&str, &str)],
+        profile: Option<&str>,
+        audit_dir: Option<&std::path::Path>,
+    ) -> Result<Self> {
+        let user = crate::incident::operator_label();
+        let params_json = redact_params_json(params, profile);
+        log_mutation_sent(action, &user, vmid, node, &params_json, audit_dir)?;
+        Ok(Self {
+            action: action.to_string(),
+            user,
+            node: node.map(str::to_string),
+            vmid,
+            params_json,
+            audit_dir: audit_dir.map(std::path::Path::to_path_buf),
+        })
+    }
+
+    /// Append the post-operation outcome entry (`"ok <status>"` or
+    /// `"error <status or transport>"`). Best-effort per Decision 1: if the
+    /// outcome write fails after the mutation has already completed, logs
+    /// `tracing::error!` without altering the caller's result.
+    pub fn record_outcome(&self, outcome: &str) {
+        if let Err(e) = with_cached_logger_at(self.audit_dir.as_deref(), |cached| {
+            cached.logger.log(
+                &self.action,
+                &self.user,
+                self.vmid,
+                self.node.as_deref(),
+                Some(&self.params_json),
+                outcome,
+            )
+        }) {
+            tracing::error!(
+                action = %self.action,
+                outcome = %outcome,
+                "audit: failed to record mutation outcome entry: {e:#}"
+            );
+        }
+    }
+}
+
+fn log_mutation_sent(
+    action: &str,
+    user: &str,
+    vmid: Option<u32>,
+    node: Option<&str>,
+    params_json: &str,
+    audit_dir: Option<&std::path::Path>,
+) -> Result<()> {
+    with_cached_logger_at(audit_dir, |cached| {
+        if cached.initial_fail_count > 0 {
+            anyhow::bail!(
+                "audit chain integrity check failed ({} tampered or unverifiable row(s))",
+                cached.initial_fail_count
+            );
+        }
+        cached.logger.verify_tail()?;
+        cached
+            .logger
+            .log(action, user, vmid, node, Some(params_json), "sent")
+    })
+    .map_err(|e| {
+        anyhow::Error::from(AuditWriteRefusal {
+            action: action.to_string(),
+            reason: format!("{e:#}"),
+        })
+    })
 }
 
 fn now_unix_secs() -> u64 {
@@ -1091,6 +1540,111 @@ mod key_rotation_tests {
             path.parent(),
             super::audit_key_path().expect("primary").parent(),
             "retired keys live beside the primary, so one backup covers both"
+        );
+    }
+
+    #[test]
+    fn parse_pve_path_extracts_node_and_vmid_when_present() {
+        assert_eq!(
+            super::parse_pve_path("/nodes/pve1/qemu/100/status/stop"),
+            (Some("pve1".to_string()), Some(100))
+        );
+        assert_eq!(
+            super::parse_pve_path("/nodes/pve2/lxc/205/snapshot"),
+            (Some("pve2".to_string()), Some(205))
+        );
+        assert_eq!(
+            super::parse_pve_path("/nodes/pve1/qemu/100?purge=1&destroy-unreferenced-disks=1"),
+            (Some("pve1".to_string()), Some(100))
+        );
+        assert_eq!(
+            super::parse_pve_path("/nodes/pve3/apt/update"),
+            (Some("pve3".to_string()), None)
+        );
+        assert_eq!(super::parse_pve_path("/access/users"), (None, None));
+    }
+
+    #[test]
+    fn redact_params_json_redacts_secrets_and_includes_profile() {
+        let json = super::redact_params_json(
+            &[
+                ("userid", "alice@pve"),
+                ("password", "hunter2"),
+                ("keys", "ssh-ed25519 AAAAsecret"),
+                ("comment", "normal comment"),
+            ],
+            Some("prod"),
+        );
+        assert!(!json.contains("hunter2"));
+        assert!(!json.contains("AAAAsecret"));
+        let parsed: serde_json::Value = serde_json::from_str(&json).expect("valid json");
+        assert_eq!(parsed["profile"], "prod");
+        assert_eq!(parsed["userid"], "alice@pve");
+        assert_eq!(parsed["password"], "[REDACTED]");
+        assert_eq!(parsed["keys"], "[REDACTED]");
+        assert_eq!(parsed["comment"], "normal comment");
+        assert_eq!(super::AuditWriteRefusal::EXIT_CODE, 8);
+    }
+
+    /// `#344` Rev. 17 regression guard: no file under `src/` or `tests/` may
+    /// mutate the process-global `PROXXX_AUDIT_DIR` or `PROXXX_AUDIT_KEY` env
+    /// vars at runtime (`set_var` / `remove_var`). Tests must inject an
+    /// explicit audit directory via `with_audit_dir` / `open_in` /
+    /// `write_ahead_at` (or pass `.env(...)` to child `Command` processes).
+    #[test]
+    fn no_source_or_test_file_mutates_proxxx_audit_env() {
+        fn collect_rs_files(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+            let entries = std::fs::read_dir(dir)
+                .unwrap_or_else(|e| panic!("read_dir {}: {e}", dir.display()));
+            for entry in entries {
+                let path = entry.expect("dir entry").path();
+                if path.is_dir() {
+                    collect_rs_files(&path, out);
+                } else if path.extension().is_some_and(|ext| ext == "rs") {
+                    out.push(path);
+                }
+            }
+        }
+
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let mut files = Vec::new();
+        collect_rs_files(&root.join("src"), &mut files);
+        collect_rs_files(&root.join("tests"), &mut files);
+        assert!(
+            !files.is_empty(),
+            "expected to scan .rs files under src/ and tests/"
+        );
+
+        let forbidden: Vec<String> = ["set_var", "remove_var"]
+            .into_iter()
+            .flat_map(|op| {
+                ["PROXXX_AUDIT_DIR", "PROXXX_AUDIT_KEY"]
+                    .into_iter()
+                    .map(move |var| format!("{op}(\"{var}\""))
+            })
+            .collect();
+
+        let mut violations = Vec::new();
+        for file in files {
+            let content = std::fs::read_to_string(&file)
+                .unwrap_or_else(|e| panic!("read {}: {e}", file.display()));
+            for (line_no, line) in content.lines().enumerate() {
+                for pat in &forbidden {
+                    if line.contains(pat) {
+                        violations.push(format!(
+                            "{}:{}: forbidden `{}` (inject audit_dir instead of mutating process env)",
+                            file.strip_prefix(root).unwrap_or(&file).display(),
+                            line_no + 1,
+                            pat
+                        ));
+                    }
+                }
+            }
+        }
+        assert!(
+            violations.is_empty(),
+            "process-global PROXXX_AUDIT_DIR / PROXXX_AUDIT_KEY mutation found:\n{}",
+            violations.join("\n")
         );
     }
 }

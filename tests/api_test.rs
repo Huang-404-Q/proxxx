@@ -27,6 +27,11 @@ mod tests {
     }
 
     pub(super) async fn mock_client(server: &MockServer) -> PxClient {
+        static TEST_AUDIT_DIR: std::sync::OnceLock<tempfile::TempDir> = std::sync::OnceLock::new();
+        let audit_dir = TEST_AUDIT_DIR
+            .get_or_init(|| tempfile::tempdir().expect("create temp audit dir for api_test"))
+            .path()
+            .to_path_buf();
         // Pass the secret via the cli_secret parameter (resolver priority
         // #1) instead of `std::env::set_var`. Env vars are process-global
         // and cargo runs integration tests in parallel — set_var would
@@ -58,6 +63,7 @@ mod tests {
         PxClient::new(cfg, Some("fake-secret"))
             .await
             .expect("client builds")
+            .with_audit_dir(audit_dir)
     }
 
     // ── Bug #1: LXC routing ─────────────────────────────────
