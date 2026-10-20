@@ -1,3 +1,4 @@
+#![allow(clippy::expect_used, clippy::panic)]
 //! Drift-proofs: documentation claims that MUST track the code.
 //!
 //! The v0.13.0 release flipped `create_snapshot` and `suspend_guest` to
@@ -134,4 +135,3 @@ fn documented_toml_blocks_have_no_unknown_fields() {
         }
     }
 }
-

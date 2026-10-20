@@ -192,6 +192,8 @@ pub struct AlertRuleConfig {
     pub name: String,
     /// One of `"node_offline" | "storage_above" | "replication_failing"`.
     /// Unknown values cause the engine to skip the rule with a warn log.
+    /// `trigger` is accepted as an alias: it is the name the documentation
+    /// uses, so both spellings parse.
     #[serde(alias = "trigger")]
     pub when: String,
     /// For `node_offline`: minimum seconds offline before firing.
@@ -1448,6 +1450,30 @@ key = "~/.ssh/id_ed25519"
         let message = err.to_string();
         assert!(
             message.contains("unknown field `key`") || message.contains("unknown field 'key'"),
+            "expected an actionable unknown-field error, got: {message}"
+        );
+    }
+
+    #[test]
+    fn rejects_unknown_key_in_policy() {
+        let err = toml::from_str::<ProfileConfig>(
+            r#"
+url = "https://pve.example:8006"
+user = "root@pam"
+
+[[policies]]
+action = "delete"
+target = "*"
+channel = "telegram"
+require = 2
+requires = 3
+"#,
+        )
+        .expect_err("a misspelled policy key must not be silently ignored");
+
+        let message = err.to_string();
+        assert!(
+            message.contains("unknown field `requires`"),
             "expected an actionable unknown-field error, got: {message}"
         );
     }

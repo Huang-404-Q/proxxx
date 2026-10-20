@@ -262,7 +262,7 @@ header to PBS you'll get a 401 with no useful diagnostic.
 ```toml
 [telegram]
 bot_token = "123456:ABC..."
-chat_id   = -1001234567890
+chat_id   = "-1001234567890"
 ```
 
 Get `bot_token` from [@BotFather](https://t.me/BotFather), `chat_id`
@@ -273,10 +273,10 @@ from any message metadata to your bot (e.g. via
 
 ```toml
 [[policies]]
-action           = "delete"          # delete | stop | restart | migrate | exec | move_disk | resize_disk
-target           = "tag:prod"        # tag:<X> | <vmid> | *
-require_approval = true
-timeout_secs     = 120               # default 120
+action  = "delete"     # delete | stop | restart | migrate | exec | move_disk | resize_disk | *
+target  = "tag:prod"   # tag:<X> | <vmid> | *
+channel = "telegram"   # approval channel
+require = 1            # approvals needed (2 or more = quorum)
 ```
 
 Multiple policies are evaluated in order; the first matching one wins.

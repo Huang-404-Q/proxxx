@@ -160,7 +160,7 @@ Used by HITL and alert routing.
 ```toml
 [telegram]
 bot_token = "123456:ABC..."           # from @BotFather
-chat_id   = -1001234567890            # from getUpdates response
+chat_id   = "-1001234567890"            # from getUpdates response
 allowed_approvers = [123456789]       # REQUIRED. Telegram numeric user ids
                                       # permitted to approve/deny. The callback
                                       # HMAC proves proxxx minted the keyboard,
@@ -175,10 +175,10 @@ allowed_approvers = [123456789]       # REQUIRED. Telegram numeric user ids
 
 ```toml
 [[policies]]
-action           = "delete"           # delete | stop | restart | migrate | exec | move_disk | resize_disk
-target           = "tag:prod"         # tag:<X> | <vmid> | * (numeric or wildcard)
-require_approval = true
-timeout_secs     = 120                # default 120
+action  = "delete"     # delete | stop | restart | migrate | exec | move_disk | resize_disk | *
+target  = "tag:prod"   # tag:<X> | <vmid> | *
+channel = "telegram"   # approval channel
+require = 1            # approvals needed (2 or more = quorum)
 ```
 
 Multiple `[[policies]]` arrays are evaluated in order. The first
@@ -270,9 +270,7 @@ location](#file-location)), these tune runtime behaviour:
 | :--- | :--- |
 | `verify_tls` | `true` |
 | `rate_limit` | `10` |
-| `port` (SSH) | `22` |
 | `user` (SSH) | `"root"` |
-| `timeout_secs` (HITL policy) | `120` |
 | `dedup_secs` (alert) | `600` |
 | `severity` (alert) | `"warning"` |
 | `auth` | `"token"` |
